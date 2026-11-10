@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""MCP server for Android development: adb, emulator, gradle.
+
+stdio transport, Python 3 standard library only. Server name: android-tools.
+Resolves the Android SDK from ANDROID_SDK_ROOT / ANDROID_HOME / ~/Library/Android/sdk,
+falls back to tools on PATH.
+"""
+
+import base64
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "1.0.0"
+
+
+def find_sdk():
+    for var in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+        value = os.environ.get(var)
+        if value and os.path.isdir(value):
+            return value
+    default = os.path.expanduser("~/Library/Android/sdk")
+    return default if os.path.isdir(default) else None
+
+
+SDK = find_sdk()
+ADB = shutil.which("adb") or (os.path.join(SDK, "platform-tools", "adb") if SDK else None)
+EMULATOR = shutil.which("emulator") or (os.path.join(SDK, "emulator", "emulator") if SDK else None)
+
+
+def run(cmd, timeout=60):
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode, out
+    except subprocess.TimeoutExpired:
+        return -1, "error: timed out after %ds: %s" % (timeout, " ".join(map(str, cmd)))
+    except FileNotFoundError:
+        return -1, "error: command not found: %s" % cmd[0]
+    except Exception as exc:  # noqa: BLE001
+        return -1, "error: %s" % exc
+
+
+def adb(args, timeout=60):
+    if not ADB:
+        return -1, "error: adb not found; install the Android SDK (platform-tools)"
+    return run([ADB] + [str(a) for a in args], timeout)
+
+
+def tail(text, limit=15000):
+    if len(text) <= limit:
+        return text
+    return "... (truncated, showing last %d chars) ...\n%s" % (limit, text[-limit:])
+
+
+def text_result(text, is_error=False):
+    return {"content": [{"type": "text", "text": str(text)}], "isError": is_error}
+
+
+def need_device(device):
+    if not device:
+        return "error: device serial is required (see device_list)"
+    return None
+
+
+# ---------------------------------------------------------------- handlers
+
+def h_sdk_info():
+    lines = ["android-tools MCP server " + VERSION, "SDK root: %s" % (SDK or "not found"), "adb: %s" % (ADB or "not found"), "emulator: %s" % (EMULATOR or "not found")]
+    if SDK and os.path.isdir(os.path.join(SDK, "platforms")):
+        lines.append("platforms: " + ", ".join(sorted(os.listdir(os.path.join(SDK, "platforms")))))
+    code, out = adb(["version"])
+    if code == 0:
+        lines.append(out.strip())
+    return text_result("\n".join(lines), is_error=SDK is None)
+
+
+def h_device_list():
+    code, out = adb(["devices", "-l"])
+    return text_result(out, is_error=code != 0)
+
+
+def h_avd_list():
+    if not EMULATOR:
+        return text_result("error: emulator binary not found", is_error=True)
+    code, out = run([EMULATOR, "-list-avds"])
+    return text_result(out or "(no AVDs defined — create one in Android Studio Device Manager)", is_error=code != 0)
+
+
+def h_emulator_start(avd, headless=False, cold=False, timeout=240):
+    if not EMULATOR:
+        return text_result("error: emulator binary not found", is_error=True)
+    cmd = [EMULATOR, "-avd", avd]
+    if headless:
+        cmd.append("-no-window")
+    if cold:
+        cmd.append("-no-snapshot-load")
+    log = open(os.devnull, "w")
+    subprocess.Popen(cmd, stdout=log, stderr=log, start_new_session=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        code, out = adb(["devices"])
+        serial = None
+        for line in out.splitlines():
+            if "emulator" in line and "device" in line:
+                serial = line.split()[0]
+                break
+        if serial:
+            code, boot = adb(["-s", serial, "shell", "getprop", "sys.boot_completed"], timeout=30)
+            if code == 0 and boot.strip() == "1":
+                return text_result("emulator %s booted: %s" % (avd, serial))
+        time.sleep(3)
+    return text_result("error: emulator %s did not finish booting in %ds (process started, check device_list)" % (avd, timeout), is_error=True)
+
+
+def h_emulator_stop(device):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    code, out = adb(["-s", device, "emu", "kill"])
+    return text_result(out or "kill signal sent to %s" % device, is_error=code != 0)
+
+
+def h_wait_for_boot(device, timeout=240):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        code, boot = adb(["-s", device, "shell", "getprop", "sys.boot_completed"], timeout=30)
+        if code == 0 and boot.strip() == "1":
+            return text_result("device %s boot completed" % device)
+        time.sleep(3)
+    return text_result("error: boot not completed after %ds" % timeout, is_error=True)
+
+
+def h_app_install(device, apk_path, replace=True):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    if not os.path.isfile(apk_path):
+        return text_result("error: apk not found: %s" % apk_path, is_error=True)
+    args = ["-s", device, "install"]
+    if replace:
+        args.append("-r")
+    args.append(apk_path)
+    code, out = adb(args, timeout=300)
+    return text_result(out, is_error=code != 0 or "Success" not in out)
+
+
+def h_app_uninstall(device, package):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    code, out = adb(["-s", device, "uninstall", package])
+    return text_result(out, is_error=code != 0)
+
+
+def h_app_launch(device, package, timeout=60):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    code, out = adb(["-s", device, "shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"], timeout=timeout)
+    ok = code == 0 and "No activities found" not in out
+    return text_result(out or "launch intent sent", is_error=not ok)
+
+
+def h_screenshot(device):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    # exec-out produces binary; capture without text decoding
+    try:
+        proc = subprocess.run([ADB, "-s", device, "exec-out", "screencap", "-p"], capture_output=True, timeout=60)
+        if proc.returncode == 0 and proc.stdout:
+            data = base64.b64encode(proc.stdout).decode("ascii")
+            return {"content": [{"type": "image", "data": data, "mimeType": "image/png"}]}
+        return text_result("error: screencap failed: %s" % proc.stderr.decode("utf-8", "replace"), is_error=True)
+    except Exception as exc:  # noqa: BLE001
+        return text_result("error: %s" % exc, is_error=True)
+
+
+def h_ui_dump(device):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    remote = "/sdcard/window_dump.xml"
+    code, out = adb(["-s", device, "shell", "uiautomator", "dump", remote], timeout=60)
+    if code != 0:
+        return text_result(out, is_error=True)
+    try:
+        proc = subprocess.run([ADB, "-s", device, "exec-out", "cat", remote], capture_output=True, timeout=60)
+    except Exception as exc:  # noqa: BLE001
+        return text_result("error: %s" % exc, is_error=True)
+    if proc.returncode != 0:
+        return text_result("error reading dump: %s" % proc.stderr.decode("utf-8", "replace"), is_error=True)
+    text = proc.stdout.decode("utf-8", "replace")
+    return text_result(tail(text, 30000))
+
+
+def h_ui_tap(device, x, y):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    code, out = adb(["-s", device, "shell", "input", "tap", x, y])
+    return text_result(out or "tapped %s %s" % (x, y), is_error=code != 0)
+
+
+def h_ui_swipe(device, x1, y1, x2, y2, duration_ms=300):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    code, out = adb(["-s", device, "shell", "input", "swipe", x1, y1, x2, y2, duration_ms])
+    return text_result(out or "swiped (%s,%s) -> (%s,%s) in %sms" % (x1, y1, x2, y2, duration_ms), is_error=code != 0)
+
+
+def h_ui_input_text(device, text):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    code, out = adb(["-s", device, "shell", "input", "text", text])
+    return text_result(out or "text sent", is_error=code != 0)
+
+
+def h_ui_key(device, key_event):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    code, out = adb(["-s", device, "shell", "input", "keyevent", key_event])
+    return text_result(out or "keyevent %s sent" % key_event, is_error=code != 0)
+
+
+def h_logcat(device, lines=200, filter=None):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    args = ["-s", device, "logcat", "-d", "-t", str(lines)]
+    if filter:
+        args.append(filter)
+    code, out = adb(args, timeout=60)
+    return text_result(tail(out, 30000), is_error=code != 0)
+
+
+def h_shell(device, command, timeout=60):
+    err = need_device(device)
+    if err:
+        return text_result(err, is_error=True)
+    code, out = adb(["-s", device, "shell"] + command.split(), timeout=timeout)
+    return text_result(tail(out, 30000), is_error=code != 0)
+
+
+def find_gradlew(project_dir):
+    current = os.path.abspath(project_dir)
+    while True:
+        candidate = os.path.join(current, "gradlew")
+        if os.path.isfile(candidate):
+            return candidate, current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None, os.path.abspath(project_dir)
+        current = parent
+
+
+def h_gradle(project_dir, tasks, timeout=900):
+    gradlew, root = find_gradlew(project_dir)
+    if not gradlew:
+        return text_result("error: gradlew not found in %s or its parents" % project_dir, is_error=True)
+    if isinstance(tasks, str):
+        tasks = tasks.split()
+    code, out = run([gradlew, "--console=plain"] + tasks, timeout=timeout)
+    summary = "exit code: %d\n%s" % (code, tail(out, 20000))
+    return text_result(summary, is_error=code != 0)
+
+
+def h_gradle_tasks(project_dir):
+    return h_gradle(project_dir, ["tasks", "--all"], timeout=300)
+
+
+# ---------------------------------------------------------------- tool table
+
+def schema(props, required=None):
+    return {"type": "object", "properties": props, "required": required or []}
+
+
+DEVICE_PROP = {"device": {"type": "string", "description": "Device serial from device_list, e.g. emulator-5554 or a physical device id"}}
+
+TOOLS = [
+    {"name": "sdk_info", "description": "Show resolved Android SDK/adb/emulator paths and installed platforms.", "inputSchema": schema({})},
+    {"name": "device_list", "description": "List connected devices and emulators (adb devices -l).", "inputSchema": schema({})},
+    {"name": "avd_list", "description": "List available emulator images/AVDs (emulator -list-avds).", "inputSchema": schema({})},
+    {"name": "emulator_start", "description": "Boot an AVD and wait until it finishes booting.", "inputSchema": schema({"avd": {"type": "string", "description": "AVD name from avd_list"}, "headless": {"type": "boolean", "description": "Run without a window (default false)"}, "cold": {"type": "boolean", "description": "Cold boot, ignore snapshot"}, "timeout": {"type": "integer", "description": "Seconds to wait for boot (default 240)"}}, ["avd"])},
+    {"name": "emulator_stop", "description": "Kill a running emulator.", "inputSchema": schema(DEVICE_PROP, ["device"])},
+    {"name": "wait_for_boot", "description": "Wait until a device reports boot completed.", "inputSchema": schema({**DEVICE_PROP, "timeout": {"type": "integer"}}, ["device"])},
+    {"name": "app_install", "description": "Install an APK on a device.", "inputSchema": schema({**DEVICE_PROP, "apk_path": {"type": "string", "description": "Absolute path to .apk"}, "replace": {"type": "boolean", "description": "Reinstall if present (default true)"}}, ["device", "apk_path"])},
+    {"name": "app_uninstall", "description": "Uninstall a package from a device.", "inputSchema": schema({**DEVICE_PROP, "package": {"type": "string"}}, ["device", "package"])},
+    {"name": "app_launch", "description": "Launch an installed app via its launcher activity (adb monkey).", "inputSchema": schema({**DEVICE_PROP, "package": {"type": "string"}}, ["device", "package"])},
+    {"name": "screenshot", "description": "Capture a PNG screenshot from the device.", "inputSchema": schema(DEVICE_PROP, ["device"])},
+    {"name": "ui_dump", "description": "Dump the current UI hierarchy (uiautomator XML) — use to find element bounds before tapping.", "inputSchema": schema(DEVICE_PROP, ["device"])},
+    {"name": "ui_tap", "description": "Tap at x/y coordinates.", "inputSchema": schema({**DEVICE_PROP, "x": {"type": "integer"}, "y": {"type": "integer"}}, ["device", "x", "y"])},
+    {"name": "ui_swipe", "description": "Swipe from (x1,y1) to (x2,y2).", "inputSchema": schema({**DEVICE_PROP, "x1": {"type": "integer"}, "y1": {"type": "integer"}, "x2": {"type": "integer"}, "y2": {"type": "integer"}, "duration_ms": {"type": "integer"}}, ["device", "x1", "y1", "x2", "y2"])},
+    {"name": "ui_input_text", "description": "Type text into the focused field (spaces must be escaped as %%s by the caller: %%s).", "inputSchema": schema({**DEVICE_PROP, "text": {"type": "string"}}, ["device", "text"])},
+    {"name": "ui_key", "description": "Send a key event (e.g. KEYCODE_BACK, KEYCODE_HOME, KEYCODE_ENTER).", "inputSchema": schema({**DEVICE_PROP, "key_event": {"type": "string"}}, ["device", "key_event"])},
+    {"name": "logcat", "description": "Read recent logcat output.", "inputSchema": schema({**DEVICE_PROP, "lines": {"type": "integer"}, "filter": {"type": "string", "description": "Optional logcat filter expression, e.g. tag:level"}} , ["device"])},
+    {"name": "shell", "description": "Run a command in the device shell (adb shell).", "inputSchema": schema({**DEVICE_PROP, "command": {"type": "string"}, "timeout": {"type": "integer"}}, ["device", "command"])},
+    {"name": "gradle", "description": "Run gradle tasks from the project (uses the nearest gradlew; output shows the tail).", "inputSchema": schema({"project_dir": {"type": "string", "description": "Any directory inside the project"}, "tasks": {"description": "Task names, e.g. [\"build\"] or \"assembleDebug test\" — may be a list or a string"}, "timeout": {"type": "integer", "description": "Seconds (default 900)"}}, ["project_dir", "tasks"])},
+    {"name": "gradle_tasks", "description": "List all available gradle tasks of the project.", "inputSchema": schema({"project_dir": {"type": "string"}}, ["project_dir"])},
+]
+
+HANDLERS = {
+    "sdk_info": lambda **kw: h_sdk_info(),
+    "device_list": lambda **kw: h_device_list(),
+    "avd_list": lambda **kw: h_avd_list(),
+    "emulator_start": h_emulator_start,
+    "emulator_stop": h_emulator_stop,
+    "wait_for_boot": h_wait_for_boot,
+    "app_install": h_app_install,
+    "app_uninstall": h_app_uninstall,
+    "app_launch": h_app_launch,
+    "screenshot": h_screenshot,
+    "ui_dump": h_ui_dump,
+    "ui_tap": h_ui_tap,
+    "ui_swipe": h_ui_swipe,
+    "ui_input_text": h_ui_input_text,
+    "ui_key": h_ui_key,
+    "logcat": h_logcat,
+    "shell": h_shell,
+    "gradle": h_gradle,
+    "gradle_tasks": h_gradle_tasks,
+}
+
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        method = req.get("method")
+        rid = req.get("id")
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": rid, "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "android-tools", "version": VERSION}}})
+        elif method == "notifications/initialized":
+            continue
+        elif method == "ping":
+            send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
+        elif method == "tools/call":
+            params = req.get("params") or {}
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            handler = HANDLERS.get(name)
+            if not handler:
+                send({"jsonrpc": "2.0", "id": rid, "result": text_result("error: unknown tool %s" % name, True)})
+                continue
+            try:
+                result = handler(**args)
+            except TypeError as exc:
+                result = text_result("error: bad arguments: %s" % exc, True)
+            except Exception as exc:  # noqa: BLE001
+                result = text_result("error: %s" % exc, True)
+            send({"jsonrpc": "2.0", "id": rid, "result": result})
+        else:
+            if rid is not None:
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found: %s" % method}})
+
+
+if __name__ == "__main__":
+    main()
