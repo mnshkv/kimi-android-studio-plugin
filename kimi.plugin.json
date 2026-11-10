@@ -23,12 +23,7 @@
     "shortDescription": "Emulators, devices, adb, gradle builds — and Android Studio IDE tools over MCP",
     "longDescription": "Two layers of Android integration for Kimi Code:\n\n1. android-tools MCP server (bundled, stdio, zero dependencies): 19 tools over adb/emulator/gradle — list devices and AVDs, boot emulators and wait for them, install/launch/uninstall APKs, take screenshots, dump the UI hierarchy (uiautomator) to find element bounds, synthesize taps/swipes/text/key events, read logcat, run device shell commands, and run gradle tasks (build, test, assembleDebug, ...) through the project's gradlew.\n\n2. Optional Android Studio IDE tools: install the official JetBrains MCP Server plugin into Android Studio (scripts/install-jetbrains-mcp-plugin.sh) and enable the MCP server in Settings → Tools → MCP Server; then add http://127.0.0.1:63342 as an MCP server in Kimi Code to get editor file access, run configurations, and other IDE tools.\n\nPrerequisites: Android SDK with platform-tools (adb). For IDE tools: Android Studio 2025.2+.",
     "developerName": "mnshkv",
-    "hostKind": "local",
-    "platforms": [
-      "macos",
-      "windows",
-      "linux"
-    ]
+    "hostKind": "local"
   },
   "mcpServers": {
     "android": {
@@ -38,5 +33,10 @@
       ],
       "cwd": "./"
     }
-  }
+  },
+  "platforms": [
+    "macos",
+    "windows",
+    "linux"
+  ]
 }
